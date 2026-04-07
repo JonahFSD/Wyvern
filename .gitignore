@@ -19,3 +19,6 @@ engine/ROADMAP.md
 # Audit artifacts
 wyvern-tech-debt-audit.html
 
+# Agent task prompts and orchestration infra (internal use only)
+AGENTS/
+

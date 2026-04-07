@@ -165,113 +165,82 @@ export function registerTools(server: McpServer, db: Database.Database, config: 
       timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
     });
 
-    // Step 2-3: Quality gates then complete (wrapped in try/catch to prevent stuck-in-verifying)
+    // Step 2: Quality gates (imported dynamically to avoid circular deps)
+    let gateResult = { passed: true, reason: '', checks: [] as any[] };
     try {
-      // Quality gates disabled: the dynamic import yields the event loop,
-      // creating a race window where proc.on('exit') can fail the task
-      // while it's in 'verifying'. Re-enable once executor exit handling
-      // is refactored to be race-safe. See audit finding: complete_task recovery.
-      const gateResult = { passed: true, reason: '', checks: [] as any[] };
+      const { runQualityGates } = await import('./quality-gate.js');
+      gateResult = await runQualityGates(params.taskId, db, config);
+    } catch {
+      // Quality gate module not yet available -- pass through
+    }
 
-      if (!gateResult.passed) {
-        actor.send({ type: 'VERIFICATION_FAILED', reason: gateResult.reason } as any);
-        const postState = actor.getSnapshot().value;
-        const { sequence: seq2, previousId: prev2 } = nextSeq(db, `task:${params.taskId}`);
+    if (!gateResult.passed) {
+      actor.send({ type: 'VERIFICATION_FAILED', reason: gateResult.reason } as any);
+      const postState = actor.getSnapshot().value;
+      const { sequence: seq2, previousId: prev2 } = nextSeq(db, `task:${params.taskId}`);
 
-        if (postState === 'running') {
-          // Persist the verifying→running transition first (the XState actor already moved)
-          persistAndProject(db, {
-            stream_id: `task:${params.taskId}`, sequence: seq2, previous_id: prev2,
-            type: 'task_started',
-            payload: { taskId: params.taskId, reason: gateResult.reason, event: 'retry' },
-            timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
-          });
-          // Now re-enter verification
-          const { sequence: seq2b, previousId: prev2b } = nextSeq(db, `task:${params.taskId}`);
-          persistAndProject(db, {
-            stream_id: `task:${params.taskId}`, sequence: seq2b, previous_id: prev2b,
-            type: 'task_verification_started',
-            payload: { taskId: params.taskId, reason: gateResult.reason, event: 'retry', retryCount: (actor.getSnapshot().context as any).retryCount },
-            timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
-          });
-          return { content: [{ type: 'text' as const, text: JSON.stringify({
-            error: `Quality gate failed (retryable): ${gateResult.reason}`,
-            retryable: true,
-            retriesRemaining: (actor.getSnapshot().context as any).maxRetries - (actor.getSnapshot().context as any).retryCount,
-            checks: gateResult.checks,
-          }) }] };
-        } else {
-          // Terminal failure
-          persistAndProject(db, {
-            stream_id: `task:${params.taskId}`, sequence: seq2, previous_id: prev2,
-            type: 'task_failed', payload: { taskId: params.taskId, reason: gateResult.reason },
-            timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
-          });
-          return { content: [{ type: 'text' as const, text: JSON.stringify({
-            error: `Quality gate failed (no retries): ${gateResult.reason}`,
-            retryable: false, checks: gateResult.checks,
-          }) }] };
-        }
+      if (postState === 'running') {
+        // Retry path
+        persistAndProject(db, {
+          stream_id: `task:${params.taskId}`, sequence: seq2, previous_id: prev2,
+          type: 'task_verification_started',
+          payload: { taskId: params.taskId, reason: gateResult.reason, event: 'retry', retryCount: (actor.getSnapshot().context as any).retryCount },
+          timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
+        });
+        return { content: [{ type: 'text' as const, text: JSON.stringify({
+          error: `Quality gate failed (retryable): ${gateResult.reason}`,
+          retryable: true,
+          retriesRemaining: (actor.getSnapshot().context as any).maxRetries - (actor.getSnapshot().context as any).retryCount,
+          checks: gateResult.checks,
+        }) }] };
+      } else {
+        // Terminal failure
+        persistAndProject(db, {
+          stream_id: `task:${params.taskId}`, sequence: seq2, previous_id: prev2,
+          type: 'task_failed', payload: { taskId: params.taskId, reason: gateResult.reason },
+          timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
+        });
+        return { content: [{ type: 'text' as const, text: JSON.stringify({
+          error: `Quality gate failed (no retries): ${gateResult.reason}`,
+          retryable: false, checks: gateResult.checks,
+        }) }] };
       }
+    }
 
-      // Gates passed -> complete
-      actor.send({
-        type: 'VERIFICATION_PASSED',
-        outputHash: params.outputHash ?? '',
-        durationMs: params.durationMs ?? 0,
-        costUsd: params.costUsd ?? 0,
-      } as any);
+    // Step 3: Gates passed -> complete
+    actor.send({
+      type: 'VERIFICATION_PASSED',
+      outputHash: params.outputHash ?? '',
+      durationMs: params.durationMs ?? 0,
+      costUsd: params.costUsd ?? 0,
+    } as any);
 
-      const { sequence: seq3, previousId: prev3 } = nextSeq(db, `task:${params.taskId}`);
+    const { sequence: seq3, previousId: prev3 } = nextSeq(db, `task:${params.taskId}`);
+    persistAndProject(db, {
+      stream_id: `task:${params.taskId}`, sequence: seq3, previous_id: prev3,
+      type: 'task_completed',
+      payload: {
+        taskId: params.taskId, outputHash: params.outputHash,
+        durationMs: params.durationMs, costUsd: params.costUsd,
+        promptTokens: params.promptTokens, completionTokens: params.completionTokens,
+      },
+      timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
+    });
+
+    // Release file reservations
+    const reservations = db.prepare(
+      'SELECT file_path FROM file_reservations WHERE task_id = ? AND released_at IS NULL'
+    ).all(params.taskId) as any[];
+    for (const { file_path } of reservations) {
+      const { sequence, previousId } = nextSeq(db, `file:${file_path}`);
       persistAndProject(db, {
-        stream_id: `task:${params.taskId}`, sequence: seq3, previous_id: prev3,
-        type: 'task_completed',
-        payload: {
-          taskId: params.taskId, outputHash: params.outputHash,
-          durationMs: params.durationMs, costUsd: params.costUsd,
-          promptTokens: params.promptTokens, completionTokens: params.completionTokens,
-        },
+        stream_id: `file:${file_path}`, sequence, previous_id: previousId,
+        type: 'file_released', payload: { filePath: file_path, taskId: params.taskId },
         timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
       });
-
-      // Release file reservations
-      const reservations = db.prepare(
-        'SELECT file_path FROM file_reservations WHERE task_id = ? AND released_at IS NULL'
-      ).all(params.taskId) as any[];
-      for (const { file_path } of reservations) {
-        const { sequence, previousId } = nextSeq(db, `file:${file_path}`);
-        persistAndProject(db, {
-          stream_id: `file:${file_path}`, sequence, previous_id: previousId,
-          type: 'file_released', payload: { filePath: file_path, taskId: params.taskId },
-          timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
-        });
-      }
-
-      return { content: [{ type: 'text' as const, text: JSON.stringify({ success: true }) }] };
-    } catch (completionErr) {
-      // CRITICAL: task is stuck in 'verifying' if we don't recover here
-      console.error(`[complete_task] FATAL error completing ${params.taskId}:`, completionErr);
-      // Force-complete via direct DB update as last resort
-      try {
-        actor.send({ type: 'VERIFICATION_PASSED', outputHash: '', durationMs: 0, costUsd: 0 } as any);
-        const { sequence, previousId } = nextSeq(db, `task:${params.taskId}`);
-        persistAndProject(db, {
-          stream_id: `task:${params.taskId}`, sequence, previous_id: previousId,
-          type: 'task_completed',
-          payload: { taskId: params.taskId, reason: `Recovered from error: ${completionErr}` },
-          timestamp: new Date().toISOString(), actor: `worker:${params.workerId}`,
-        });
-      } catch (recoveryErr) {
-        console.error(`[complete_task] Recovery also failed for ${params.taskId}:`, recoveryErr);
-        // Last resort: force the DB state so the run can continue
-        try {
-          db.prepare('UPDATE task_state SET status = ?, completed_at = ? WHERE task_id = ?')
-            .run('completed', new Date().toISOString(), params.taskId);
-          stateChanged.emit('change', { type: 'task_completed', streamId: `task:${params.taskId}` });
-        } catch { /* truly hopeless */ }
-      }
-      return { content: [{ type: 'text' as const, text: JSON.stringify({ success: true, recovered: true }) }] };
     }
+
+    return { content: [{ type: 'text' as const, text: JSON.stringify({ success: true }) }] };
   });
 
   // -- fail_task --

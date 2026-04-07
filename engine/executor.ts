@@ -197,9 +197,13 @@ export async function executeLoop(
       }
 
       // No cache hit -- spawn agent
-      // Worktree isolation disabled for now: agents create files that
-      // downstream tasks need to read, and removeWorktree deletes them.
-      const worktreePath = projectRoot;
+      let worktreePath = projectRoot;
+      try {
+        worktreePath = createWorktree(projectRoot, taskId);
+      } catch {
+        logger.warn('worktree-failed', { taskId });
+        // Fall back to project root
+      }
 
       const vcrPort = 3100 + parseInt(taskId.replace(/\D/g, ''), 10);
       const vcrProxy = createVcrProxy(db, taskId, 'api.anthropic.com', 'record', vcrPort);
@@ -217,20 +221,19 @@ export async function executeLoop(
         }
       });
 
-      // MCP config removed — agents auto-complete via exit code, no MCP needed
+      const mcpConfigPath = join(worktreePath, '.wyvern-mcp.json');
+      await writeFile(mcpConfigPath, JSON.stringify({
+        mcpServers: {
+          wyvern: { type: 'http', url: `http://127.0.0.1:${mcpPort}/mcp` },
+        },
+      }));
 
-      const rawPrompt = taskPrompt || taskDescription || `Complete task ${taskId}`;
-      const prompt = [
-        `You are a Wyvern agent working on task ${taskId}.`,
-        `Complete the work described below. When done, just exit -- the orchestrator will detect completion.`,
-        ``,
-        `--- TASK ---`,
-        rawPrompt,
-      ].join('\n');
+      const prompt = taskPrompt || taskDescription || `Complete task ${taskId}`;
       const modelArgs = taskModel !== 'opus' ? ['--model', `claude-${taskModel}-4-6`] : [];
       const proc = spawn('claude', [
         '--dangerously-skip-permissions',
         ...modelArgs,
+        '--mcp-config', mcpConfigPath,
         '-p', '-',
       ], {
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -294,50 +297,28 @@ export async function executeLoop(
           inFlight.delete(taskId);
         }
 
-        // Resolve task to terminal state based on exit code.
-        // The MCP HTTP transport only supports one session at a time,
-        // so agents often can't call complete_task via MCP when running
-        // in parallel. Exit code 0 = success, anything else = failure.
+        // Ensure task reaches terminal state
         const taskRow = db.prepare('SELECT status FROM task_state WHERE task_id = ?').get(taskId) as { status: string } | undefined;
         if (taskRow && !['completed', 'failed', 'timeout', 'cancelled'].includes(taskRow.status)) {
           const taskActor = getTaskActor(taskId);
           if (taskActor) {
-            if (code === 0) {
-              // Agent exited cleanly -- auto-complete
-              logger.info('agent-auto-complete', { taskId });
-              // Drive through verifying → completed
-              taskActor.send({ type: 'VERIFICATION_STARTED' });
-              const { sequence: vs, previousId: vp } = nextSeq(db, `task:${taskId}`);
-              persistAndProject(db, {
-                stream_id: `task:${taskId}`, sequence: vs, previous_id: vp,
-                type: 'task_verification_started', payload: { taskId },
-                timestamp: new Date().toISOString(), actor: 'executor',
-              });
-              taskActor.send({ type: 'VERIFICATION_PASSED', outputHash: '', durationMs: 0, costUsd: 0 } as any);
-              const { sequence: cs, previousId: cp } = nextSeq(db, `task:${taskId}`);
-              persistAndProject(db, {
-                stream_id: `task:${taskId}`, sequence: cs, previous_id: cp,
-                type: 'task_completed', payload: { taskId, durationMs: 0, costUsd: 0 },
-                timestamp: new Date().toISOString(), actor: 'executor',
-              });
-            } else {
-              const reason = code === null
-                ? 'Agent process killed (signal)'
+            const reason = code === null
+              ? 'Agent process killed (signal)'
+              : code === 0
+                ? 'Agent exited without calling complete_task or fail_task'
                 : `Agent process exited with code ${code}`;
-              taskActor.send({ type: 'FAIL', reason });
-              const { sequence, previousId } = nextSeq(db, `task:${taskId}`);
-              persistAndProject(db, {
-                stream_id: `task:${taskId}`, sequence, previous_id: previousId,
-                type: 'task_failed', payload: { taskId, reason },
-                timestamp: new Date().toISOString(), actor: 'executor',
-              });
-            }
+            taskActor.send({ type: 'FAIL', reason });
+            const { sequence, previousId } = nextSeq(db, `task:${taskId}`);
+            persistAndProject(db, {
+              stream_id: `task:${taskId}`, sequence, previous_id: previousId,
+              type: 'task_failed', payload: { taskId, reason },
+              timestamp: new Date().toISOString(), actor: 'executor',
+            });
           }
         }
         stateChanged.emit('change', { type: 'exit_check', streamId: `task:${taskId}` });
 
-        // Worktree disabled — nothing to clean up
-        // try { removeWorktree(projectRoot, taskId); } catch { /* already cleaned */ }
+        try { removeWorktree(projectRoot, taskId); } catch { /* already cleaned */ }
       });
     }
   };
