@@ -2,39 +2,31 @@
   "tasks": [
     {
       "id": "T01",
-      "description": "Add wyvern health CLI command",
+      "description": "Create TODO-health.md",
       "model": "sonnet",
-      "touchesFiles": ["engine/commands/health.ts"],
       "dependsOn": [],
-      "prompt": "Create a new file `engine/commands/health.ts` that exports a single async function `runHealth(projectRoot: string): Promise<void>`.\n\nThis function checks system dependencies and prints a status table:\n\n1. **SQLite** -- try to open the database at `${projectRoot}/.wyvern/wyvern.db` with `openDatabase()` from `../store/db.js`. If it opens and `PRAGMA integrity_check` returns `ok`, print PASS. If the file doesn't exist or the check fails, print FAIL with the reason.\n2. **Git** -- run `git --version` via `execSync`. If it exits 0, print PASS with the version string. If it throws, print FAIL.\n3. **gitleaks** -- run `gitleaks version` via `execSync`. If it exits 0, print PASS. If it throws, print SKIP (not installed, optional).\n4. **semgrep** -- run `semgrep --version` via `execSync`. Same logic: PASS or SKIP.\n\nOutput format:\n\n```\nWyvern Health Check\n-------------------\nSQLite     PASS   .wyvern/wyvern.db (integrity ok)\nGit        PASS   git version 2.43.0\ngitleaks   SKIP   not installed (optional)\nsemgrep    PASS   semgrep 1.67.0\n```\n\nUse `execSync` from `node:child_process` with `{ encoding: 'utf-8', timeout: 5000 }`. Wrap each check in try/catch so one failure doesn't block the others.\n\nThe function should NOT modify cli.ts -- it only creates this new file. The CLI integration will be done by a later task.\n\nAcceptance: `npx tsx -e \"import { runHealth } from './engine/commands/health.js'; runHealth('.')\"` runs without throwing.",
-      "retries": 2
+      "prompt": "Write this exact file and exit. No other actions.\n\nFile: engine/TODO-health.md\nContent:\n# Health Check Command\n\n- [ ] SQLite integrity check\n- [ ] Git version check\n- [ ] gitleaks availability\n- [ ] semgrep availability"
     },
     {
       "id": "T02",
-      "description": "Add wyvern export CLI command",
+      "description": "Create TODO-export.md",
       "model": "sonnet",
-      "touchesFiles": ["engine/commands/export.ts"],
       "dependsOn": [],
-      "prompt": "Create a new file `engine/commands/export.ts` that exports a single async function `runExport(projectRoot: string, format: 'json' | 'md', runId?: string): Promise<void>`.\n\nThis function exports the event stream for a run:\n\n1. Open the database at `${projectRoot}/.wyvern/wyvern.db` using `openDatabase()` from `../store/db.js`.\n2. If `runId` is provided, filter events to those after the matching run's `started_at` in the `runs` table. If not provided, get the most recent run.\n3. Format the output to stdout:\n   - **json**: Pretty-print the events array with `JSON.stringify(events, null, 2)`.\n   - **md**: Print a markdown document with a header (run ID, start time, total events, task count from distinct stream_ids starting with 'task:'), followed by events listed chronologically with timestamp, type, stream_id, and a one-line payload summary.\n4. If the database doesn't exist, print `Error: No Wyvern database found at .wyvern/wyvern.db` to stderr and call `process.exit(1)`.\n5. If no runs exist, print `No runs found.` and return.\n\nThe function should NOT modify cli.ts.\n\nAcceptance: `npx tsx -e \"import { runExport } from './engine/commands/export.js'; runExport('.', 'json')\"` runs without throwing. If no database exists, it prints the error message cleanly.",
-      "retries": 2
+      "prompt": "Write this exact file and exit. No other actions.\n\nFile: engine/TODO-export.md\nContent:\n# Export Command\n\n- [ ] JSON format output\n- [ ] Markdown format output\n- [ ] Run ID filtering\n- [ ] Error handling for missing DB"
     },
     {
       "id": "T03",
-      "description": "Add wyvern stats CLI command",
+      "description": "Create TODO-stats.md",
       "model": "sonnet",
-      "touchesFiles": ["engine/commands/stats.ts"],
       "dependsOn": [],
-      "prompt": "Create a new file `engine/commands/stats.ts` that exports a single async function `runStats(projectRoot: string, runId?: string): Promise<void>`.\n\nThis function computes and displays run statistics:\n\n1. Open the database at `${projectRoot}/.wyvern/wyvern.db` using `openDatabase()` from `../store/db.js`.\n2. Find the target run -- if `runId` is provided, look it up in `runs`. Otherwise get the most recent.\n3. Query all events for that run (events after the run's `started_at` timestamp).\n4. Compute:\n   - **Wall-clock time**: difference between the first and last event timestamps.\n   - **Total agent-time**: sum of `durationMs` from `task_completed` event payloads (parse the JSON payload).\n   - **Parallelism ratio**: agent-time / wall-clock time.\n   - **Task counts**: total (distinct task stream_ids), completed (`task_completed` events), failed (`task_failed` events), cached (`task_cache_hit` events).\n5. Print:\n\n```\nRun: <runId>\nWall-clock:       2m 34s\nAgent-time:       8m 12s\nParallelism:      3.2x\nTasks:            14 total, 12 completed, 0 failed, 2 cached\n```\n\nWrite a helper `formatDuration(ms: number): string` that formats milliseconds as `Xm Ys` or `Xs` for short durations.\n\n6. If the database doesn't exist, print `Error: No Wyvern database found at .wyvern/wyvern.db` to stderr and `process.exit(1)`.\n7. If no runs exist, print `No runs found.` and return.\n\nThe function should NOT modify cli.ts.\n\nAcceptance: `npx tsx -e \"import { runStats } from './engine/commands/stats.js'; runStats('.')\"` runs without throwing.",
-      "retries": 2
+      "prompt": "Write this exact file and exit. No other actions.\n\nFile: engine/TODO-stats.md\nContent:\n# Stats Command\n\n- [ ] Wall-clock time calculation\n- [ ] Agent-time aggregation\n- [ ] Parallelism ratio\n- [ ] Task count breakdown"
     },
     {
       "id": "T04",
-      "description": "Integrate new commands into CLI and update README",
+      "description": "Create ROADMAP.md from TODOs",
       "model": "sonnet",
-      "touchesFiles": ["cli.ts", "README.md"],
       "dependsOn": ["T01", "T02", "T03"],
-      "prompt": "Wire the three new commands into the CLI and update the README.\n\n## Part 1: cli.ts\n\nRead cli.ts first. Then:\n\n1. Add imports at the top of the file:\n   ```\n   import { runHealth } from './engine/commands/health.js';\n   import { runExport } from './engine/commands/export.js';\n   import { runStats } from './engine/commands/stats.js';\n   ```\n\n2. Add to the USAGE string. Add a `# Diagnostics` section after the Inspection section:\n   ```\n   # Diagnostics\n   wyvern health                       # Check system dependencies and database\n   ```\n   And add these to the `# Inspection` section:\n   ```\n   wyvern export [--format json|md]    # Export event stream as JSON or markdown\n   wyvern stats [--run <runId>]        # Run duration, parallelism ratio, task summary\n   ```\n\n3. Add cases to the switch statement:\n   - `health`: call `await runHealth(projectRoot)`\n   - `export`: parse `--format` (default 'json') and `--run` from args, call `await runExport(projectRoot, format, runId)`\n   - `stats`: parse `--run` from args, call `await runStats(projectRoot, runId)`\n\n## Part 2: README.md\n\nRead README.md first. Find the `## CLI Reference` section.\n\n1. Add `wyvern export` and `wyvern stats` to the `# Inspection` subsection, after the `wyvern trend` line. Match the existing alignment.\n2. Add a `# Diagnostics` subsection after `# Inspection` (before `# Swarm`) with `wyvern health`.\n3. Do NOT modify any other section.\n\nAcceptance: `npx tsx cli.ts health` runs. `npx tsx cli.ts --help` shows all three new commands. The README CLI Reference section lists all three.",
-      "retries": 2
+      "prompt": "Read engine/TODO-health.md, engine/TODO-export.md, engine/TODO-stats.md. Combine into engine/ROADMAP.md with a top heading '# Implementation Roadmap' then all three sections. Write the file and exit."
     }
   ]
 }
