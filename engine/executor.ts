@@ -38,7 +38,7 @@ export async function executeLoop(
   // 2. Start MCP server
   const mcpServer = createMcpServer(db, config);
   const mcpPort = (config as unknown as Record<string, unknown>).mcpPort as number || 3001;
-  const httpServer = startHttpServer(mcpServer, mcpPort);
+  const httpServer = await startHttpServer(mcpServer, mcpPort);
   logger.info('mcp-server-started', { port: mcpPort });
 
   // 3. Check for crash recovery

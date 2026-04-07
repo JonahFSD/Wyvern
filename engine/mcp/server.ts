@@ -14,12 +14,22 @@ export function createMcpServer(db: Database.Database, config: WyvernConfig): Mc
   return server;
 }
 
-export function startHttpServer(mcpServer: McpServer, port: number = 3001): http.Server {
+export async function startHttpServer(mcpServer: McpServer, port: number = 3001): Promise<http.Server> {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => crypto.randomUUID(),
+  });
+  await mcpServer.connect(transport);
+
   const httpServer = http.createServer(async (req, res) => {
-    if (req.url === '/mcp' && req.method === 'POST') {
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => crypto.randomUUID() });
-      await mcpServer.connect(transport);
-      await transport.handleRequest(req, res);
+    if (req.url === '/mcp') {
+      try {
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        if (!res.headersSent) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: String(err) }));
+        }
+      }
     } else {
       res.writeHead(404);
       res.end();
