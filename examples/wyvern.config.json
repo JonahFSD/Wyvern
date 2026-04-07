@@ -1,0 +1,21 @@
+{
+  "profile": "web-app",
+  "pollInterval": 5,
+  "killDelay": 3,
+  "watchdogTimeout": 900,
+  "maxPromptLines": { "min": 8, "max": 120 },
+  "defaultModel": "sonnet",
+  "verifyCommands": [
+    "npx tsc --noEmit",
+    "npm test -- --passWithNoTests"
+  ],
+  "enableSnapshots": true,
+  "enableCostTracking": true,
+  "enableOutputCapture": true,
+  "parallelTasksPerGate": 4,
+  "modelConfig": {
+    "opus": { "maxPromptLines": { "min": 8, "max": 80 } },
+    "sonnet": { "maxPromptLines": { "min": 8, "max": 120 } },
+    "haiku": { "maxPromptLines": { "min": 4, "max": 60 } }
+  }
+}
