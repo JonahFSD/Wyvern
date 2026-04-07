@@ -2944,4 +2944,4 @@ The rearchitecture is complete when:
 
 ---
 
-*This spec is the blueprint. Every layer, every tool, every guard, every security check -- it all ships as one system. Test at each dependency boundary, and the system will be correct by construction.*
+*This spec is the blueprint. Every layer, every tool, every guard, every security check all ships as one system. Test at each dependency boundary, and the system will be correct by construction.*
