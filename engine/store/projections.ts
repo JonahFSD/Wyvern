@@ -6,9 +6,9 @@ export function updateTaskProjection(db: Database.Database, event: WyvernEvent):
     case 'task_created': {
       const p = event.payload;
       db.prepare(`
-        INSERT INTO task_state (task_id, status, gate, model, description, depends_on, touches_files, prompt_hash)
-        VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)
-      `).run(p.taskId, p.gate, p.model, p.description ?? null, JSON.stringify(p.dependsOn ?? []), JSON.stringify(p.touchesFiles ?? []), p.promptHash ?? null);
+        INSERT INTO task_state (task_id, status, gate, model, description, prompt, depends_on, touches_files, prompt_hash)
+        VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+      `).run(p.taskId, p.gate, p.model, p.description ?? null, p.prompt ?? null, JSON.stringify(p.dependsOn ?? []), JSON.stringify(p.touchesFiles ?? []), p.promptHash ?? null);
       break;
     }
     case 'task_claimed': {

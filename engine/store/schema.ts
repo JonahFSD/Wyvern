@@ -39,6 +39,7 @@ export function initializeSchema(db: Database.Database): void {
       gate INTEGER NOT NULL,
       model TEXT NOT NULL,
       description TEXT,
+      prompt TEXT,
       depends_on TEXT,
       touches_files TEXT,
       prompt_hash TEXT,

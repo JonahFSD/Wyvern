@@ -82,6 +82,7 @@ export async function executeLoop(
     gate?: number;
     model?: string;
     description?: string;
+    prompt?: string;
     blockedBy?: string[];
     dependsOn?: string[];
     touchesFiles?: string[];
@@ -110,14 +111,16 @@ export async function executeLoop(
     const existing = db.prepare('SELECT task_id FROM task_state WHERE task_id = ?').get(task.id);
     if (existing) continue;
 
-    const promptHash = crypto.createHash('sha256').update(task.description || '').digest('hex');
+    const fullPrompt = task.prompt || task.description || '';
+    const promptHash = crypto.createHash('sha256').update(fullPrompt).digest('hex');
 
     persistAndProject(db, {
       stream_id: `task:${task.id}`, sequence: 1, previous_id: null,
       type: 'task_created',
       payload: {
         taskId: task.id, gate: task.tier ?? task.gate ?? 1, model: task.model ?? 'sonnet',
-        description: task.description, dependsOn: task.blockedBy ?? task.dependsOn ?? [],
+        description: task.description, prompt: fullPrompt,
+        dependsOn: task.blockedBy ?? task.dependsOn ?? [],
         promptHash, touchesFiles: task.touchesFiles ?? [],
       },
       timestamp: new Date().toISOString(), actor: 'executor',
@@ -153,6 +156,7 @@ export async function executeLoop(
       const taskId = task.task_id as string;
       const taskModel = task.model as string;
       const taskDescription = task.description as string | null;
+      const taskPrompt = task.prompt as string | null;
       const taskPromptHash = task.prompt_hash as string | null;
       const taskDependsOn = task.depends_on as string | null;
       const taskTouchesFiles = task.touches_files as string | null;
@@ -224,7 +228,7 @@ export async function executeLoop(
         },
       }));
 
-      const prompt = taskDescription || `Complete task ${taskId}`;
+      const prompt = taskPrompt || taskDescription || `Complete task ${taskId}`;
       const modelArgs = taskModel !== 'opus' ? ['--model', `claude-${taskModel}-4-6`] : [];
       const proc = spawn('claude', [
         '--dangerously-skip-permissions',
