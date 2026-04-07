@@ -22,3 +22,6 @@ wyvern-tech-debt-audit.html
 # Agent task prompts and orchestration infra (internal use only)
 AGENTS/
 
+# Self-build worktree branches (created during runs)
+.wyvern-mcp.json
+

@@ -1,0 +1,130 @@
+{
+  "tasks": [
+    {
+      "id": "T01",
+      "description": "SQLite Database Setup",
+      "model": "sonnet",
+      "touchesFiles": ["engine/store/db.ts", "engine/store/schema.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nCreate the database module. Reference REARCHITECTURE.md §4 \"Database Setup\" and \"Schema.\"\n\n`engine/store/db.ts`:\n- `openDatabase(dbPath: string): Database.Database` -- opens SQLite with WAL, NORMAL sync, 5s busy timeout, foreign keys ON\n- Export the type for consumers\n\n`engine/store/schema.ts`:\n- `initializeSchema(db: Database.Database): void` -- creates all tables if not exist:\n  -- `events` (append-only, UNIQUE(stream_id, sequence), indexes on stream, type, timestamp)\n  -- `task_state` (projection, CHECK constraint on status, BEFORE trigger for valid transitions)\n  -- `file_reservations` (projection)\n  -- `context` (projection)\n  -- `execution_cache` (write-once: no hit_count, no last_hit_at, includes vcr_conversation_id)\n  -- `vcr_cassettes` (write-once, UNIQUE(conversation_id, sequence_number), indexes)\n  -- `runs` (write-once: no status/completed_at columns, just id/started_at/config/total_tasks)\n  -- `security_findings` (write-once: no resolved flag)\n- Include ALL indexes from the spec\n- The BEFORE trigger must match the XState machine transitions exactly (see Analysis §2 for the matrix)\n\nAcceptance:\n```bash\nnpx tsx -e \"\nimport { openDatabase } from './engine/store/db.js';\nimport { initializeSchema } from './engine/store/schema.js';\nimport { mkdirSync } from 'fs';\nmkdirSync('.wyvern', { recursive: true });\nconst db = openDatabase('.wyvern/test.db');\ninitializeSchema(db);\n// Verify tables exist\nconst tables = db.prepare(\\\"SELECT name FROM sqlite_master WHERE type='table'\\\").all();\nconsole.log('Tables:', tables.map(t => t.name).sort());\n// Verify trigger exists\nconst triggers = db.prepare(\\\"SELECT name FROM sqlite_master WHERE type='trigger'\\\").all();\nconsole.log('Triggers:', triggers.map(t => t.name));\n// Verify BEFORE trigger blocks illegal transition\ndb.prepare(\\\"INSERT INTO task_state (task_id, status, gate, model) VALUES ('test', 'pending', 1, 'sonnet')\\\").run();\ntry {\n  db.prepare(\\\"UPDATE task_state SET status = 'completed' WHERE task_id = 'test'\\\").run();\n  console.log('ERROR: trigger did not fire');\n  process.exit(1);\n} catch (e) {\n  console.log('PASS: trigger blocked illegal transition:', e.message);\n}\ndb.close();\n\"\n```",
+      "retries": 2
+    },
+    {
+      "id": "T02",
+      "description": "Event Store Operations",
+      "model": "sonnet",
+      "touchesFiles": ["engine/store/events.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §4 \"Event Types\" and \"Event Store Operations.\"\n\n- Define `EventType` union (all types including security events)\n- Define `WyvernEvent` interface\n- `appendEvent(db, event): number` -- INSERT into events, return lastInsertRowid\n- `replayStream(db, streamId): WyvernEvent[]` -- SELECT ordered by sequence\n- `replayAll(db, since?): WyvernEvent[]` -- SELECT all or since timestamp\n- `getLastEvent(db, streamId): WyvernEvent | null` -- SELECT ... ORDER BY sequence DESC LIMIT 1\n\nAcceptance:\n```bash\nnpx tsx -e \"\nimport { openDatabase } from './engine/store/db.js';\nimport { initializeSchema } from './engine/store/schema.js';\nimport { appendEvent, replayStream, getLastEvent } from './engine/store/events.js';\nconst db = openDatabase('.wyvern/test.db');\ninitializeSchema(db);\nconst id = appendEvent(db, { stream_id: 'task:T01', sequence: 1, previous_id: null, type: 'task_created', payload: { taskId: 'T01' }, timestamp: new Date().toISOString(), actor: 'test' });\nconsole.log('Event ID:', id);\nconst events = replayStream(db, 'task:T01');\nconsole.log('Events:', events.length === 1 ? 'PASS' : 'FAIL');\nconst last = getLastEvent(db, 'task:T01');\nconsole.log('Last event:', last?.type === 'task_created' ? 'PASS' : 'FAIL');\ndb.close();\n\"\n```",
+      "retries": 2
+    },
+    {
+      "id": "T03",
+      "description": "Projections",
+      "model": "sonnet",
+      "touchesFiles": ["engine/store/projections.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §4 \"Projections.\"\n\n- `updateTaskProjection(db, event): void` -- switch on event.type, handle ALL cases: task_created, task_claimed, task_started, task_completed, task_failed, task_timeout, task_cache_hit, task_cancelled, task_verification_started\n- `updateFileProjection(db, event): void` -- file_reserved, file_released\n- `updateContextProjection(db, event): void` -- context_written\n- `applyEvent(db, event): void` -- calls all three updaters\n- `rebuildProjections(db): void` -- DELETE all projection tables, replay all events through applyEvent\n\nCritical: The projection functions use `event.timestamp` for all temporal fields, never `new Date()`. This ensures replay produces identical results.\n\nAcceptance:\n```bash\nnpx tsx -e \"\nimport { openDatabase } from './engine/store/db.js';\nimport { initializeSchema } from './engine/store/schema.js';\nimport { appendEvent } from './engine/store/events.js';\nimport { applyEvent, rebuildProjections } from './engine/store/projections.js';\nconst db = openDatabase('.wyvern/test.db');\ninitializeSchema(db);\n// Create task\nconst ts = new Date().toISOString();\nconst e1 = { stream_id: 'task:T01', sequence: 1, previous_id: null, type: 'task_created', payload: { taskId: 'T01', gate: 1, model: 'sonnet', description: 'test', dependsOn: [], promptHash: 'abc' }, timestamp: ts, actor: 'test' };\nconst id1 = appendEvent(db, e1);\napplyEvent(db, { ...e1, id: id1 });\n// Verify projection\nlet row = db.prepare('SELECT * FROM task_state WHERE task_id = ?').get('T01');\nconsole.log('Status:', row.status === 'pending' ? 'PASS' : 'FAIL');\n// Rebuild and verify same result\nrebuildProjections(db);\nrow = db.prepare('SELECT * FROM task_state WHERE task_id = ?').get('T01');\nconsole.log('After rebuild:', row.status === 'pending' ? 'PASS' : 'FAIL');\ndb.close();\n\"\n```",
+      "retries": 2
+    },
+    {
+      "id": "T04",
+      "description": "XState Task Machine",
+      "model": "sonnet",
+      "touchesFiles": ["engine/machines/task.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §5 \"Task Lifecycle Machine.\"\n\n- Define `TaskContext` and `TaskEvent` types\n- Define all guards: `dependenciesMet`, `withinBudget`, `filesAvailable`, `canRetry`\n- Define all actions: `assignWorker`, `incrementRetry`, `setFailureReason`\n- Create the machine with `setup().createMachine()` -- 8 states, all transitions per the spec\n- Export `taskMachine`, `TaskContext`, `TaskEvent`\n\nAcceptance:\n```bash\nnpx tsx -e \"\nimport { createActor } from 'xstate';\nimport { taskMachine } from './engine/machines/task.js';\n// Test happy path\nconst actor = createActor(taskMachine, { input: { taskId: 'T01', gate: 1, model: 'sonnet', dependsOn: [], touchesFiles: [], workerId: null, retryCount: 0, maxRetries: 3, failureReason: null } });\nactor.start();\nconsole.log('Initial:', actor.getSnapshot().value);\nactor.send({ type: 'CLAIM', workerId: 'w1' });\nconsole.log('After CLAIM:', actor.getSnapshot().value === 'claimed' ? 'PASS' : 'FAIL');\nactor.send({ type: 'START' });\nconsole.log('After START:', actor.getSnapshot().value === 'running' ? 'PASS' : 'FAIL');\nactor.send({ type: 'VERIFICATION_STARTED' });\nconsole.log('After VERIF:', actor.getSnapshot().value === 'verifying' ? 'PASS' : 'FAIL');\nactor.send({ type: 'VERIFICATION_PASSED', outputHash: 'x', durationMs: 100, costUsd: 0.01 });\nconsole.log('After PASS:', actor.getSnapshot().value === 'completed' ? 'PASS' : 'FAIL');\n// Test illegal transition: CLAIM from completed\nactor.send({ type: 'CLAIM', workerId: 'w2' });\nconsole.log('Completed stays:', actor.getSnapshot().value === 'completed' ? 'PASS' : 'FAIL');\n// Test retry path\nconst actor2 = createActor(taskMachine, { input: { taskId: 'T02', gate: 1, model: 'sonnet', dependsOn: [], touchesFiles: [], workerId: null, retryCount: 0, maxRetries: 2, failureReason: null } });\nactor2.start();\nactor2.send({ type: 'CLAIM', workerId: 'w1' });\nactor2.send({ type: 'START' });\nactor2.send({ type: 'VERIFICATION_STARTED' });\nactor2.send({ type: 'VERIFICATION_FAILED', reason: 'lint failed' });\nconsole.log('After retry:', actor2.getSnapshot().value === 'running' ? 'PASS' : 'FAIL');\nconsole.log('Retry count:', actor2.getSnapshot().context.retryCount === 1 ? 'PASS' : 'FAIL');\n\"\n```",
+      "retries": 2
+    },
+    {
+      "id": "T05",
+      "description": "XState Orchestrator Machine",
+      "model": "sonnet",
+      "touchesFiles": ["engine/machines/orchestrator.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §5 \"Orchestrator Machine.\"\n\n- Define `OrchestratorContext`, `OrchestratorEvent`\n- Guards: `allTasksFinished`, `hasFailures`\n- States: planning, executing, draining, completed, completedWithFailures, stalled, aborted\n- Export `orchestratorMachine`\n\nAcceptance: Create actor, send PLAN_PARSED, send TASK_COMPLETED × N, send ALL_DONE, verify state is `completed`.",
+      "retries": 2
+    },
+    {
+      "id": "T06",
+      "description": "Actor Registry",
+      "model": "sonnet",
+      "touchesFiles": ["engine/machines/registry.ts", "engine/machines/guards.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §5 \"XState as Runtime\" section.\n\n`engine/machines/registry.ts`:\n- `getOrCreateTaskActor(taskId, initialContext): TaskActor` -- Map-backed registry\n- `getTaskActor(taskId): TaskActor | undefined`\n- `hydrateActors(db): void` -- rebuild all actors from task_state + event history\n- `eventToXState(type, payload): TaskEvent` -- maps event store types to XState events\n\n`engine/machines/guards.ts`:\n- Export any shared guard helpers used across machines\n\nAcceptance: Create two actors, verify they're independent. Hydrate from a DB with events, verify actor states match projections.",
+      "retries": 2
+    },
+    {
+      "id": "T10",
+      "description": "Security Scanners",
+      "model": "sonnet",
+      "touchesFiles": ["engine/security/scanner.ts", "engine/security/secrets.ts", "engine/security/sast.ts", "engine/security/dependencies.ts", "engine/security/context-integrity.ts", "engine/security/types.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §12 \"Layer 8: Security Auditing\" -- ALL of it.\n\nThis is a self-contained module. Implement every file exactly as specified:\n- `types.ts`: SecretFinding, SastFinding, DependencyFinding, ContextIntegrityResult, SecurityConfig, DEFAULT_SECURITY_CONFIG, SecurityScanResult\n- `secrets.ts`: scanSecretsInDiff (gitleaks primary, betterleaks fallback)\n- `sast.ts`: runSastOnModifiedFiles (semgrep)\n- `dependencies.ts`: shouldAuditDependencies, auditNpmDependencies, auditPipDependencies\n- `context-integrity.ts`: validateContextWrite (scope check, injection patterns, size bounds, overwrite detection), signContextEntry, verifyContextSignature\n- `scanner.ts`: runSecurityScan (orchestrates all checks, returns SecurityScanResult)\n\nAcceptance: Unit tests for injection pattern detection in context-integrity. Verify scanner returns clean result when no tools are installed (graceful degradation).",
+      "retries": 2
+    },
+    {
+      "id": "T11",
+      "description": "Filesystem Isolation",
+      "model": "sonnet",
+      "touchesFiles": ["engine/isolation/worktree.ts", "engine/isolation/sandbox.ts"],
+      "dependsOn": [],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §9 \"Layer 5: Filesystem Isolation.\"\n\n- `worktree.ts`: createWorktree, removeWorktree, mergeWorktree\n- `sandbox.ts`: generateSandboxProfile (macOS sandbox-exec .sb file generation)\n\nAcceptance: Create a worktree from the current repo, verify it exists, remove it.",
+      "retries": 2
+    },
+    {
+      "id": "T07",
+      "description": "MCP Server + Tools",
+      "model": "opus",
+      "touchesFiles": ["engine/mcp/server.ts", "engine/mcp/tools.ts", "engine/mcp/types.ts"],
+      "dependsOn": ["T01", "T02", "T03", "T04", "T05", "T06"],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nThis is the most critical task. Reference REARCHITECTURE.md §6 \"Layer 2: MCP Coordination Server\" -- the ENTIRE section.\n\n`engine/mcp/server.ts`:\n- `createMcpServer(db, config): McpServer`\n- `startHttpServer(mcpServer, port): http.Server`\n- StreamableHTTPServerTransport on `/mcp`\n\n`engine/mcp/types.ts`:\n- Request/response types for all tools\n\n`engine/mcp/tools.ts`:\n- `stateChanged` EventEmitter (executor subscribes to this)\n- `persistAndProject(db, event): number` -- the SINGLE code path. With try/catch for actor rehydration on persist failure.\n- `nextSeq(db, streamId)` helper\n- `registerTools(server, db, config)` -- all 9 tools:\n  -- `claim_task` -- XState actor send → persist → project. Terminal-state rejection includes `currentStatus`, `isTerminal`, `alreadyCompleted`.\n  -- `start_task` -- same pattern\n  -- `complete_task` -- verification flow: VERIFICATION_STARTED → quality gate → VERIFICATION_PASSED or VERIFICATION_FAILED (with retry check). Releases file reservations via events.\n  -- `fail_task` -- same pattern, includes `alreadyFailed` on terminal rejection\n  -- `report_progress` -- event-only, no XState transition\n  -- `read_context` -- pure read\n  -- `write_context` -- context integrity check BEFORE persist\n  -- `reserve_file` -- check exclusivity, persist\n  -- `query_cache` -- persist cache_checked event (not mutable counter)\n\nCRITICAL INVARIANTS (from Analysis §3, §4):\n1. No inline `UPDATE task_state` anywhere in this file\n2. Every state change goes through `persistAndProject`\n3. XState actor is the authority -- check `before === after` to detect rejection\n4. `persistAndProject` wraps in try/catch and rehydrates actor on failure\n5. Terminal-state rejections include status info for idempotency\n\nAcceptance:\n```bash\n# Start MCP server, call claim_task via HTTP, verify event + projection\nnpx tsx -e \"\nimport { openDatabase } from './engine/store/db.js';\nimport { initializeSchema } from './engine/store/schema.js';\nimport { createMcpServer, startHttpServer } from './engine/mcp/server.js';\n// ... setup, create task, call claim_task via fetch to localhost:3001/mcp\n// ... verify task_state shows 'claimed', events table has task_claimed event\n\"\n```",
+      "retries": 2
+    },
+    {
+      "id": "T08",
+      "description": "Quality Gate",
+      "model": "sonnet",
+      "touchesFiles": ["engine/mcp/quality-gate.ts"],
+      "dependsOn": ["T07", "T10"],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §6 \"Quality Gate (Server-Side)\" and §12 \"Updated Quality Gate.\"\n\n- Port checks from `swarm/hooks/task-completed.ts` (read that file for the 6 existing checks)\n- Add touchesFiles validation (git diff --name-only vs file_reservations)\n- Integrate security scanning (call `runSecurityScan` from T10)\n- Return `QualityGateResult` with structured check details\n\nAcceptance: Mock a task that modified an undeclared file → gate rejects. Mock a clean task → gate passes.",
+      "retries": 2
+    },
+    {
+      "id": "T09",
+      "description": "Cache + VCR",
+      "model": "sonnet",
+      "touchesFiles": ["engine/cache/manifest.ts", "engine/cache/store.ts", "engine/vcr/proxy.ts", "engine/vcr/cassette.ts"],
+      "dependsOn": ["T01", "T02", "T03"],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nCache -- Reference REARCHITECTURE.md §7:\n- `manifest.ts`: `computeManifestHash(inputs)`, `getRelevantFileHashes(root, touchesFiles)` (git ls-tree, NOT git write-tree), `computeConfigHash(config)`\n- `store.ts`: cache lookup, cache write, cache stats queries\n\nVCR -- Reference REARCHITECTURE.md §8:\n- `proxy.ts`: `createVcrProxy(db, taskId, targetHost, mode, listenPort)` -- sequence-based matching, NOT content-hash. Uses `conversationId` + monotonic `sequenceCounter`. Strict replay returns 500 on sequence overflow.\n- `cassette.ts`: helpers for cassette queries, conversation ID management\n\nAcceptance:\n- Manifest hash is deterministic: same inputs → same hash across runs\n- `getRelevantFileHashes` returns different hashes when a touched file changes, same hash when untouched files change\n- VCR proxy records and replays by sequence position",
+      "retries": 2
+    },
+    {
+      "id": "T12",
+      "description": "Executor Rewrite",
+      "model": "opus",
+      "touchesFiles": ["engine/executor.ts"],
+      "dependsOn": ["T07", "T08", "T09", "T10", "T11"],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nReference REARCHITECTURE.md §10 \"Layer 6: Executor Rewrite\" -- the ENTIRE section.\n\nThis is the full rewrite. Key architecture points:\n\n1. Event-driven, not poll-based. Subscribe to `stateChanged` EventEmitter from MCP tools. No `sleep(pollInterval)`.\n2. Crash recovery: detect stale run → `rebuildProjections(db)` → `hydrateActors(db)` → cancel stale tasks via XState → persistAndProject → re-parse plan.\n3. Task lifecycle: For each ready task: check cache → if hit, CACHE_HIT via XState → persist. If miss: create worktree → start VCR proxy (with `on('error')` handler) → write MCP config → build prompt → spawn claude process → pre-claim + start via XState → persist.\n4. Process tracking: `inFlight` Map tracks proc/vcrProxy/watchdog per task. `proc.on('exit')` cleans up AND captures task failure if not in terminal state.\n5. Completion detection: `stateChanged` handler checks remaining count. If 0 → resolve. If stalled → log and resolve.\n6. Finalization: run_completed/run_failed event via persistAndProject (not mutable UPDATE on runs table).\n\nAcceptance: Create a 3-task DAG (T01→T02→T03 where T02 depends on T01, T03 depends on T02). Execute. All three complete in order. Events are in the stream. Cache entries are written.",
+      "retries": 2
+    },
+    {
+      "id": "T13",
+      "description": "Config, Prompt Builder, CLI Updates",
+      "model": "sonnet",
+      "touchesFiles": ["engine/config.ts", "engine/prompt-builder.ts", "cli.ts"],
+      "dependsOn": ["T12"],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nconfig.ts -- Add to WyvernConfig interface:\n- `mcpPort?: number` (default 3001)\n- `security?: SecurityConfig`\n- `budgetLimitUsd?: number`\n- `parallelTasksPerGate?: number`\n\nprompt-builder.ts -- Update agent prompt template to reference MCP tools:\n- Add \"When Done\" and \"If Something Goes Wrong\" sections per REARCHITECTURE.md §6 \"Agent MCP Config\"\n- Replace `{{context:key}}` resolution with instruction to use `mcp__wyvern__read_context`\n\ncli.ts -- Add observability subcommands per REARCHITECTURE.md §11:\n- `wyvern status` -- current run task states\n- `wyvern history` -- past runs\n- `wyvern events [--stream X]` -- raw event log\n- `wyvern costs [--run N]` -- cost breakdown\n- `wyvern cache-stats` -- hit rate, savings\n- `wyvern timeline [--run N]` -- task execution timeline\n- `wyvern replay <taskId>` -- show all events for a task\n- `wyvern context` -- current context key-value pairs\n\nAll queries are SQL over the event store / projections. See §11 for the exact queries.\n\nAcceptance: `npx tsx cli.ts status` runs without error against an empty DB. `npx tsx cli.ts events` returns an empty list.",
+      "retries": 2
+    },
+    {
+      "id": "T14",
+      "description": "Delete Old Files + End-to-End Tests",
+      "model": "opus",
+      "touchesFiles": [],
+      "dependsOn": ["T12", "T13", "T10", "T11"],
+      "prompt": "Read the files docs/SPEC.md and docs/ANALYSIS.md in full before starting. They are the complete specification and formal analysis for this rearchitecture.\n\nDelete (per REARCHITECTURE.md §13):\n- `engine/plan-parser.ts`\n- `engine/snapshot.ts`\n- `engine/file-lock.ts`\n- `engine/audit.ts`\n- `engine/maintenance.ts`\n- `swarm/hooks/task-completed.ts`\n\nDO NOT delete anything in `swarm/` that's still imported (check with grep first). Keep `swarm/dependency-graph.ts`, `swarm/types.ts`, `swarm/conventions/`.\n\nUpdate `package.json`:\n```json\n{\n  \"dependencies\": {\n    \"better-sqlite3\": \"^11.0.0\",\n    \"xstate\": \"^5.0.0\",\n    \"@modelcontextprotocol/sdk\": \"^1.0.0\",\n    \"zod\": \"^3.23.0\"\n  },\n  \"devDependencies\": {\n    \"@types/better-sqlite3\": \"^7.6.0\"\n  }\n}\n```\n\nVerify `npx tsc --noEmit` passes (no type errors across the entire project).\n\nRun verification criteria from REARCHITECTURE.md §16 -- at minimum:\n- #1: Unit tests for event store, XState machines, manifest hashing\n- #2: Integration test: MCP server → claim → complete → verify events + projections\n- #8: BEFORE trigger fires on illegal direct SQL\n- #13: XState rejects illegal transition AND trigger agrees\n- #14: rebuildProjections matches live state\n- #17: XState/trigger consistency (exhaustive enumeration)\n\nAcceptance: `npx tsc --noEmit` exits 0. All verification tests pass.",
+      "retries": 2
+    }
+  ]
+}

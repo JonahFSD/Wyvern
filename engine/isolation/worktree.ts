@@ -1,5 +1,6 @@
 import { execSync } from 'node:child_process';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 
 export function createWorktree(
   projectRoot: string,
@@ -9,10 +10,35 @@ export function createWorktree(
   const worktreePath = join(projectRoot, '.wyvern', 'worktrees', taskId);
   const branchName = branch || `wyvern/${taskId}`;
 
+  // Clean up stale worktree if it exists from a previous run
+  if (existsSync(worktreePath)) {
+    try {
+      execSync(`git worktree remove ${worktreePath} --force`, { cwd: projectRoot, stdio: 'pipe' });
+    } catch {
+      // If remove fails, prune and retry
+      try {
+        execSync('git worktree prune', { cwd: projectRoot, stdio: 'pipe' });
+      } catch { /* best effort */ }
+    }
+  } else {
+    // Path doesn't exist but git might still have a stale worktree record
+    try {
+      execSync('git worktree prune', { cwd: projectRoot, stdio: 'pipe' });
+    } catch { /* best effort */ }
+  }
+
+  // Delete stale branch if it exists
+  try {
+    execSync(`git branch -D ${branchName}`, { cwd: projectRoot, stdio: 'pipe' });
+  } catch {
+    // Branch doesn't exist, that's fine
+  }
+
+  // Create fresh branch and worktree
   try {
     execSync(`git branch ${branchName}`, { cwd: projectRoot, stdio: 'pipe' });
   } catch {
-    // Branch may already exist
+    // Branch may already exist (shouldn't after the delete above, but be safe)
   }
 
   execSync(`git worktree add ${worktreePath} ${branchName}`, {

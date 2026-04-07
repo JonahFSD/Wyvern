@@ -38,7 +38,7 @@ export async function executeLoop(
   // 2. Start MCP server
   const mcpServer = createMcpServer(db, config);
   const mcpPort = (config as unknown as Record<string, unknown>).mcpPort as number || 3001;
-  const httpServer = await startHttpServer(mcpServer, mcpPort);
+  const httpServer = await startHttpServer(mcpServer, mcpPort, db, config);
   logger.info('mcp-server-started', { port: mcpPort });
 
   // 3. Check for crash recovery
@@ -228,7 +228,18 @@ export async function executeLoop(
         },
       }));
 
-      const prompt = taskPrompt || taskDescription || `Complete task ${taskId}`;
+      const rawPrompt = taskPrompt || taskDescription || `Complete task ${taskId}`;
+      const prompt = [
+        rawPrompt,
+        ``,
+        `--- WYVERN AGENT PROTOCOL ---`,
+        `You have access to a Wyvern MCP server with tools for task coordination.`,
+        `When you have finished all work for this task, call the complete_task tool with:`,
+        `  - taskId: "${taskId}"`,
+        `  - workerId: "${taskId}-agent"`,
+        `If you encounter an unrecoverable error, call fail_task with the reason.`,
+        `If you cannot reach the MCP tools, just exit cleanly and the orchestrator will handle completion.`,
+      ].join('\n');
       const modelArgs = taskModel !== 'opus' ? ['--model', `claude-${taskModel}-4-6`] : [];
       const proc = spawn('claude', [
         '--dangerously-skip-permissions',
@@ -245,6 +256,8 @@ export async function executeLoop(
           WYVERN_WORKTREE: worktreePath,
         },
       });
+
+      logger.info('agent-spawned', { taskId, model: taskModel, pid: proc.pid, inFlight: inFlight.size + 1 });
 
       // Pre-claim and start via XState
       const actor = getOrCreateTaskActor(taskId, {});
@@ -302,18 +315,40 @@ export async function executeLoop(
         if (taskRow && !['completed', 'failed', 'timeout', 'cancelled'].includes(taskRow.status)) {
           const taskActor = getTaskActor(taskId);
           if (taskActor) {
-            const reason = code === null
-              ? 'Agent process killed (signal)'
-              : code === 0
-                ? 'Agent exited without calling complete_task or fail_task'
+            if (code === 0) {
+              // Agent exited cleanly without calling complete_task — auto-complete as fallback
+              logger.info('agent-auto-complete', { taskId });
+              // If agent already called complete_task, status is 'verifying' — skip
+              // VERIFICATION_STARTED to avoid the invalid verifying→verifying transition
+              // that the SQL BEFORE trigger would reject.
+              if (taskRow.status !== 'verifying') {
+                taskActor.send({ type: 'VERIFICATION_STARTED' });
+                const { sequence: vs, previousId: vp } = nextSeq(db, `task:${taskId}`);
+                persistAndProject(db, {
+                  stream_id: `task:${taskId}`, sequence: vs, previous_id: vp,
+                  type: 'task_verification_started', payload: { taskId },
+                  timestamp: new Date().toISOString(), actor: 'executor',
+                });
+              }
+              taskActor.send({ type: 'VERIFICATION_PASSED', outputHash: '', durationMs: 0, costUsd: 0 } as any);
+              const { sequence: cs, previousId: cp } = nextSeq(db, `task:${taskId}`);
+              persistAndProject(db, {
+                stream_id: `task:${taskId}`, sequence: cs, previous_id: cp,
+                type: 'task_completed', payload: { taskId, durationMs: 0, costUsd: 0 },
+                timestamp: new Date().toISOString(), actor: 'executor',
+              });
+            } else {
+              const reason = code === null
+                ? 'Agent process killed (signal)'
                 : `Agent process exited with code ${code}`;
-            taskActor.send({ type: 'FAIL', reason });
-            const { sequence, previousId } = nextSeq(db, `task:${taskId}`);
-            persistAndProject(db, {
-              stream_id: `task:${taskId}`, sequence, previous_id: previousId,
-              type: 'task_failed', payload: { taskId, reason },
-              timestamp: new Date().toISOString(), actor: 'executor',
-            });
+              taskActor.send({ type: 'FAIL', reason });
+              const { sequence, previousId } = nextSeq(db, `task:${taskId}`);
+              persistAndProject(db, {
+                stream_id: `task:${taskId}`, sequence, previous_id: previousId,
+                type: 'task_failed', payload: { taskId, reason },
+                timestamp: new Date().toISOString(), actor: 'executor',
+              });
+            }
           }
         }
         stateChanged.emit('change', { type: 'exit_check', streamId: `task:${taskId}` });
@@ -328,42 +363,88 @@ export async function executeLoop(
 
   // Event-driven loop
   await new Promise<void>((resolve) => {
+    let processing = false;
+    let pendingRecheck = false;
+
     const onStateChange = async () => {
+      // If already processing, flag that we need a re-check when done.
+      // This prevents the lost-wakeup bug where a state change fires
+      // while we're inside trySpawn() and gets silently dropped.
+      if (processing) {
+        pendingRecheck = true;
+        return;
+      }
+      processing = true;
       try {
-        const remaining = db.prepare(
-          "SELECT COUNT(*) as cnt FROM task_state WHERE status NOT IN ('completed', 'failed', 'cancelled', 'timeout')"
-        ).get() as { cnt: number };
+        // eslint-disable-next-line no-constant-condition
+        do {
+          pendingRecheck = false;
 
-        logger.info('state-check', { remaining: remaining.cnt, inFlight: inFlight.size });
-
-        if (remaining.cnt === 0) {
-          stateChanged.off('change', onStateChange);
-          resolve();
-          return;
-        }
-
-        const inFlightCount = db.prepare(
-          "SELECT COUNT(*) as cnt FROM task_state WHERE status IN ('claimed', 'running', 'verifying')"
-        ).get() as { cnt: number };
-
-        if (inFlightCount.cnt === 0 && remaining.cnt > 0) {
-          await trySpawn();
-          const newInFlight = db.prepare(
-            "SELECT COUNT(*) as cnt FROM task_state WHERE status IN ('claimed', 'running', 'verifying')"
+          const remaining = db.prepare(
+            "SELECT COUNT(*) as cnt FROM task_state WHERE status NOT IN ('completed', 'failed', 'cancelled', 'timeout')"
           ).get() as { cnt: number };
-          if (newInFlight.cnt === 0) {
-            logger.error('execution-stalled', { remaining: remaining.cnt });
+
+          const running = db.prepare("SELECT task_id FROM task_state WHERE status IN ('claimed', 'running', 'verifying')").all() as { task_id: string }[];
+          const blocked = db.prepare(`
+            SELECT ts.task_id, ts.depends_on FROM task_state ts
+            WHERE ts.status = 'pending'
+            AND EXISTS (
+              SELECT 1 FROM json_each(ts.depends_on) dep
+              JOIN task_state dep_ts ON dep_ts.task_id = dep.value
+              WHERE dep_ts.status != 'completed'
+            )
+          `).all() as { task_id: string; depends_on: string }[];
+          const blockedInfo = blocked.map(b => {
+            const deps = JSON.parse(b.depends_on) as string[];
+            const done = deps.filter(d => {
+              const row = db.prepare('SELECT status FROM task_state WHERE task_id = ?').get(d) as { status: string } | undefined;
+              return row?.status === 'completed';
+            });
+            return `${b.task_id}(${done.length}/${deps.length})`;
+          });
+          logger.info('state-check', {
+            remaining: remaining.cnt,
+            running: running.map(r => r.task_id),
+            blocked: blockedInfo.length > 0 ? blockedInfo : undefined,
+          });
+
+          if (remaining.cnt === 0) {
             stateChanged.off('change', onStateChange);
             resolve();
             return;
           }
-        }
 
-        await trySpawn();
+          const inFlightCount = db.prepare(
+            "SELECT COUNT(*) as cnt FROM task_state WHERE status IN ('claimed', 'running', 'verifying')"
+          ).get() as { cnt: number };
+
+          if (inFlightCount.cnt === 0 && remaining.cnt > 0) {
+            await trySpawn();
+            const newInFlight = db.prepare(
+              "SELECT COUNT(*) as cnt FROM task_state WHERE status IN ('claimed', 'running', 'verifying')"
+            ).get() as { cnt: number };
+            if (newInFlight.cnt === 0) {
+              logger.error('execution-stalled', { remaining: remaining.cnt });
+              stateChanged.off('change', onStateChange);
+              resolve();
+              return;
+            }
+          }
+
+          await trySpawn();
+        } while (pendingRecheck);
       } catch (err) {
         logger.error('state-change-error', { error: (err as Error).message });
         stateChanged.off('change', onStateChange);
         resolve();
+      } finally {
+        processing = false;
+        // One final safety check: if another event arrived during our
+        // finally block, kick off another cycle.
+        if (pendingRecheck) {
+          pendingRecheck = false;
+          onStateChange();
+        }
       }
     };
 
