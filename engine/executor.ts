@@ -264,6 +264,16 @@ export async function executeLoop(
         timestamp: new Date().toISOString(), actor: 'executor',
       });
 
+      // Capture agent output for diagnostics
+      let stderrBuf = '';
+      let stdoutBuf = '';
+      proc.stdout!.on('data', (d: Buffer) => { stdoutBuf += d.toString(); });
+      proc.stderr!.on('data', (d: Buffer) => {
+        const line = d.toString();
+        stderrBuf += line;
+        logger.warn('agent-stderr', { taskId, line: line.trim() });
+      });
+
       proc.stdin!.write(prompt);
       proc.stdin!.end();
 
@@ -279,6 +289,7 @@ export async function executeLoop(
 
       // Clean up on process exit
       proc.on('exit', (code) => {
+        logger.info('agent-exited', { taskId, code, stderr: stderrBuf.slice(-500), stdout: stdoutBuf.slice(-500) });
         const entry = inFlight.get(taskId);
         if (entry) {
           entry.vcrProxy.close();

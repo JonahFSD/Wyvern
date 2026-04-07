@@ -43,7 +43,7 @@ export function createVcrProxy(
       return;
     }
 
-    // Forward to real API
+    // Forward to real API -- stream response through to preserve SSE
     const proxyReq = https.request({
       hostname: targetHost,
       port: 443,
@@ -51,12 +51,17 @@ export function createVcrProxy(
       method: req.method,
       headers: { ...req.headers, host: targetHost },
     }, (proxyRes) => {
-      const responseChunks: Buffer[] = [];
-      proxyRes.on('data', (chunk) => responseChunks.push(chunk));
-      proxyRes.on('end', () => {
-        const responseBody = Buffer.concat(responseChunks).toString('utf-8');
+      res.writeHead(proxyRes.statusCode!, proxyRes.headers);
 
-        if (mode === 'record') {
+      if (mode === 'record') {
+        // Tee: stream to client AND buffer for recording
+        const responseChunks: Buffer[] = [];
+        proxyRes.on('data', (chunk: Buffer) => {
+          responseChunks.push(chunk);
+          res.write(chunk);
+        });
+        proxyRes.on('end', () => {
+          const responseBody = Buffer.concat(responseChunks).toString('utf-8');
           db.prepare(`
             INSERT INTO vcr_cassettes
             (task_id, conversation_id, sequence_number, request_body, response_body,
@@ -69,11 +74,12 @@ export function createVcrProxy(
             )),
             extractModel(requestBody), new Date().toISOString(),
           );
-        }
-
-        res.writeHead(proxyRes.statusCode!, proxyRes.headers);
-        res.end(responseBody);
-      });
+          res.end();
+        });
+      } else {
+        // Passthrough -- just pipe
+        proxyRes.pipe(res);
+      }
     });
 
     proxyReq.on('error', (err) => {
