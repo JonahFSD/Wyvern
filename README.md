@@ -4,6 +4,8 @@
 
 Wyvern is a TypeScript engine that coordinates multiple AI agents working in parallel on a codebase. You give it a plan -- a structured list of tasks, their dependencies, and what files each one will touch -- and it handles everything else: scheduling, isolation, quality checking, crash recovery, caching, and audit logging.
 
+Right now, if you want multiple AI agents to build something together, you're babysitting terminal windows and praying they don't overwrite each other's files. Wyvern fixes that. Each agent gets its own isolated copy of the repo, a state machine enforces what they're allowed to do and when, an event log captures everything that happens, and a content-addressed cache means re-runs only redo the work that actually changed. The result: you write a plan, run one command, and walk away.
+
 ---
 
 ## Table of Contents
