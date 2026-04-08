@@ -1,5 +1,5 @@
 # Wyvern
-
+https://www.youtube.com/watch?v=vc0o1eFAhtQ
 > `make` for AI agents.
 
 Wyvern is a TypeScript engine that coordinates multiple AI agents working in parallel on a codebase. You give it a plan -- a structured list of tasks, their dependencies, and what files each one will touch -- and it handles everything else: scheduling, isolation, quality checking, crash recovery, caching, and audit logging.
