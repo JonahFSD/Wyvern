@@ -2,7 +2,7 @@
 https://www.youtube.com/watch?v=vc0o1eFAhtQ
 > `make` for AI agents.
 
-Edit - this is an attempt at solving a very, very difficult problem that nobody has done yet. I have not tested if it actually works. All of this is theory. 
+Edit - this is an attempt at solving a very, very difficult problem that nobody has done yet. I have not tested if it actually works. All of this is theory, given a hard enougn task it could just make slop at scale. 
 Wyvern is a TypeScript engine that coordinates multiple AI agents working in parallel on a codebase. You give it a plan -- a structured list of tasks, their dependencies, and what files each one will touch -- and it handles everything else: scheduling, isolation, quality checking, crash recovery, caching, and audit logging.
 
 Right now, if you want multiple AI agents to build something together, you're babysitting terminal windows and praying they don't overwrite each other's files. Wyvern fixes that. Each agent gets its own isolated copy of the repo, a state machine enforces what they're allowed to do and when, an event log captures everything that happens, and a content-addressed cache means re-runs only redo the work that actually changed. The result: you write a plan, run one command, and walk away.
